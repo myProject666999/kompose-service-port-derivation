@@ -38,6 +38,10 @@ const (
 	LabelServiceGroup = "kompose.service.group"
 	// LabelNodePortPort defines the port value for NodePort service
 	LabelNodePortPort = "kompose.service.nodeport.port"
+	// LabelNodePortPorts defines nodePort values per container port, in the form
+	// "80:30080,443:30443". It is an alternative to LabelNodePortPort and the two
+	// must not be used together for the same service.
+	LabelNodePortPorts = "kompose.service.nodeport.ports"
 	// LabelServiceExpose defines if the service needs to be made accessible from outside the cluster or not
 	LabelServiceExpose = "kompose.service.expose"
 	// LabelServiceExposeTLSSecret provides the name of the TLS secret to use with the Kubernetes ingress controller

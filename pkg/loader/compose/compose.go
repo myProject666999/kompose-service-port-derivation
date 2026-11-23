@@ -19,6 +19,7 @@ package compose
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"reflect"
 	"strconv"
@@ -275,43 +276,157 @@ func loadVolumes(volumes []types.ServiceVolumeConfig) []string {
 	return volArray
 }
 
-// Convert Compose ports to kobject.Ports
-// expose ports will be treated as TCP ports
-func loadPorts(ports []types.ServicePortConfig, expose []string) []kobject.Ports {
+// loadPorts converts Compose ports to kobject.Ports.
+// expose ports will be treated as TCP ports.
+//
+// Problems that used to be swallowed (a published range silently becoming 0,
+// for instance) are returned as PortIssues instead of being dropped. The caller
+// decides whether they are logged, and the transformer fails on the errors.
+func loadPorts(serviceName string, ports []types.ServicePortConfig, expose []string) ([]kobject.Ports, []kobject.PortIssue) {
 	komposePorts := []kobject.Ports{}
+	var issues []kobject.PortIssue
 	exist := map[string]bool{}
 
+	addIssue := func(severity kobject.PortIssueSeverity, category, message string) {
+		issues = append(issues, kobject.PortIssue{
+			Severity: severity,
+			Category: category,
+			Service:  serviceName,
+			Message:  message,
+		})
+	}
+	// A compose "5000-5010:5000-5010" range expands to eleven entries sharing one
+	// host IP; warn once per address rather than once per port.
+	warnedLoopback := map[string]bool{}
+
 	for _, port := range ports {
-		// Convert to a kobject struct with ports
+		protocol := strings.ToUpper(port.Protocol)
+		if protocol == "" {
+			protocol = string(api.ProtocolTCP)
+		}
+		mode := strings.ToLower(port.Mode)
+		if mode == "" {
+			mode = kobject.PortModeIngress
+		}
+		if mode != kobject.PortModeHost && mode != kobject.PortModeIngress {
+			addIssue(kobject.PortIssueError, kobject.PortCategoryMode,
+				fmt.Sprintf("unsupported mode %q on port %d/%s, supported values are %q and %q", port.Mode, port.Target, strings.ToLower(protocol), kobject.PortModeHost, kobject.PortModeIngress))
+			continue
+		}
+
+		hostPort := int32(0)
+		if port.Published != "" {
+			// compose-go expands "8000-8010:9000-9010" into one entry per port,
+			// but "8000-8010:80" (a host range aimed at a single container port)
+			// stays a range in Published. Converting that with cast.ToInt32 used
+			// to yield 0, silently turning the port into "no host port".
+			if strings.Contains(port.Published, "-") {
+				addIssue(kobject.PortIssueError, kobject.PortCategoryRange,
+					fmt.Sprintf("published port range %q on container port %d is not supported; declare one host-to-container port mapping per line or use matching ranges such as 8000-8010:9000-9010", port.Published, port.Target))
+				continue
+			}
+			parsed, err := strconv.ParseInt(strings.TrimSpace(port.Published), 10, 32)
+			if err != nil || parsed <= 0 || parsed > 65535 {
+				addIssue(kobject.PortIssueError, kobject.PortCategoryRange,
+					fmt.Sprintf("invalid published port %q on container port %d", port.Published, port.Target))
+				continue
+			}
+			hostPort = int32(parsed)
+		}
+
+		if port.Target == 0 || port.Target > 65535 {
+			addIssue(kobject.PortIssueError, kobject.PortCategoryRange,
+				fmt.Sprintf("invalid container port %d", port.Target))
+			continue
+		}
+
+		if port.HostIP != "" && isLoopbackAddress(port.HostIP) && !warnedLoopback[port.HostIP] {
+			warnedLoopback[port.HostIP] = true
+			addIssue(kobject.PortIssueWarning, kobject.PortCategoryExposure,
+				fmt.Sprintf("host IP %s is a loopback address; binding is only meant for the local host, but a Service exposes the port cluster-wide and NodePort/LoadBalancer expose it further", port.HostIP))
+		}
+
 		komposePorts = append(komposePorts, kobject.Ports{
-			HostPort:      cast.ToInt32(port.Published),
+			HostPort:      hostPort,
 			ContainerPort: int32(port.Target),
 			HostIP:        port.HostIP,
-			Protocol:      strings.ToUpper(port.Protocol),
+			Protocol:      protocol,
+			Mode:          mode,
 		})
-		exist[cast.ToString(port.Target)+port.Protocol] = true
+		exist[cast.ToString(port.Target)+protocol] = true
 	}
 
 	for _, port := range expose {
 		portValue := port
-		protocol := string(api.ProtocolTCP)
+		protocol := strings.ToUpper(string(api.ProtocolTCP))
 		if strings.Contains(portValue, "/") {
 			splits := strings.Split(port, "/")
 			portValue = splits[0]
-			protocol = splits[1]
+			protocol = strings.ToUpper(splits[1])
 		}
 
-		if exist[portValue+protocol] {
+		// compose accepts ranges in expose (e.g. "3000-3002"); they are exact
+		// container port sets, so expand them instead of losing them to 0.
+		containerPorts, err := parseContainerPorts(portValue)
+		if err != nil {
+			addIssue(kobject.PortIssueError, kobject.PortCategoryRange,
+				fmt.Sprintf("invalid expose entry %q: %v", port, err))
 			continue
 		}
-		komposePorts = append(komposePorts, kobject.Ports{
-			ContainerPort: cast.ToInt32(portValue),
-			HostIP:        "",
-			Protocol:      strings.ToUpper(protocol),
-		})
+
+		for _, containerPort := range containerPorts {
+			if exist[cast.ToString(containerPort)+protocol] {
+				continue
+			}
+			komposePorts = append(komposePorts, kobject.Ports{
+				ContainerPort: containerPort,
+				HostIP:        "",
+				Protocol:      protocol,
+				Mode:          kobject.PortModeIngress,
+			})
+			exist[cast.ToString(containerPort)+protocol] = true
+		}
 	}
 
-	return komposePorts
+	return komposePorts, issues
+}
+
+// parseContainerPorts parses a single port ("80") or an inclusive range
+// ("3000-3002") into the list of ports it denotes.
+func parseContainerPorts(value string) ([]int32, error) {
+	parts := strings.SplitN(strings.TrimSpace(value), "-", 2)
+	first, err := strconv.ParseInt(parts[0], 10, 32)
+	if err != nil || first <= 0 || first > 65535 {
+		return nil, fmt.Errorf("invalid port %q", value)
+	}
+	if len(parts) == 1 {
+		return []int32{int32(first)}, nil
+	}
+	last, err := strconv.ParseInt(parts[1], 10, 32)
+	if err != nil || last <= 0 || last > 65535 {
+		return nil, fmt.Errorf("invalid port %q", value)
+	}
+	if last < first {
+		return nil, fmt.Errorf("port range %q ends before it starts", value)
+	}
+	// Guard against absurd ranges in the input.
+	if last-first > 65535 {
+		return nil, fmt.Errorf("port range %q is too large", value)
+	}
+	ports := make([]int32, 0, last-first+1)
+	for p := first; p <= last; p++ {
+		ports = append(ports, int32(p))
+	}
+	return ports, nil
+}
+
+// isLoopbackAddress reports whether hostIP is a loopback IP literal.
+func isLoopbackAddress(hostIP string) bool {
+	ip := net.ParseIP(strings.TrimSpace(hostIP))
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback()
 }
 
 /*
@@ -469,6 +584,7 @@ func dockerComposeToKomposeMapping(composeObject *types.Project) (kobject.Kompos
 		// No need to modify before importation
 		name := parseResourceName(composeServiceConfig.Name, composeServiceConfig.Labels)
 		serviceConfig := kobject.ServiceConfig{}
+		var portIssues []kobject.PortIssue
 		serviceConfig.Name = normalizeServiceNames(name)
 		serviceConfig.Image = composeServiceConfig.Image
 		serviceConfig.WorkingDir = composeServiceConfig.WorkingDir
@@ -532,6 +648,14 @@ func dockerComposeToKomposeMapping(composeObject *types.Project) (kobject.Kompos
 
 			if composeServiceConfig.Deploy.EndpointMode == "vip" {
 				serviceConfig.ServiceType = string(api.ServiceTypeNodePort)
+				serviceConfig.ServiceTypeExplicit = true
+			} else if composeServiceConfig.Deploy.EndpointMode == "dnsrr" {
+				// Swarm's dnsrr skips the virtual IP and returns task addresses
+				// directly, which maps onto a Headless Service.
+				serviceConfig.ServiceType = ServiceTypeHeadless
+				serviceConfig.ServiceTypeExplicit = true
+			} else if composeServiceConfig.Deploy.EndpointMode != "" {
+				return kobject.KomposeObject{}, errors.Errorf("unsupported endpoint_mode %q for service %s, supported values are 'vip' and 'dnsrr'", composeServiceConfig.Deploy.EndpointMode, name)
 			}
 		}
 
@@ -577,7 +701,7 @@ func dockerComposeToKomposeMapping(composeObject *types.Project) (kobject.Kompos
 		// https://docs.docker.com/compose/compose-file/#ports
 
 		// here we will translate `expose` too, they basically means the same thing in kubernetes
-		serviceConfig.Port = loadPorts(composeServiceConfig.Ports, serviceConfig.Expose)
+		serviceConfig.Port, portIssues = loadPorts(serviceConfig.Name, composeServiceConfig.Ports, serviceConfig.Expose)
 
 		// Parse the volumes
 		// Again, in v3, we use the "long syntax" for volumes in terms of parsing
@@ -586,6 +710,7 @@ func dockerComposeToKomposeMapping(composeObject *types.Project) (kobject.Kompos
 		if err := parseKomposeLabels(composeServiceConfig.Labels, &serviceConfig); err != nil {
 			return kobject.KomposeObject{}, err
 		}
+		serviceConfig.PortIssues = portIssues
 
 		// Log if the name will been changed
 		if normalizeServiceNames(name) != name {
@@ -752,6 +877,9 @@ func parseKomposeLabels(labels map[string]string, serviceConfig *kobject.Service
 			}
 
 			serviceConfig.ServiceType = serviceType
+			// An explicit label wins over anything derived from ports, even the
+			// empty label value (which normalizes to ClusterIP).
+			serviceConfig.ServiceTypeExplicit = true
 		case LabelServiceExternalTrafficPolicy:
 			serviceExternalTypeTrafficPolicy, err := handleServiceExternalTrafficPolicy(value)
 			if err != nil {
@@ -767,6 +895,12 @@ func parseKomposeLabels(labels map[string]string, serviceConfig *kobject.Service
 			serviceConfig.ExposeService = strings.Trim(value, " ,")
 		case LabelNodePortPort:
 			serviceConfig.NodePortPort = cast.ToInt32(value)
+		case LabelNodePortPorts:
+			nodePorts, err := parseNodePortsLabel(value)
+			if err != nil {
+				return errors.Wrap(err, "invalid "+LabelNodePortPorts)
+			}
+			serviceConfig.NodePortPorts = nodePorts
 		case LabelServiceExposeTLSSecret:
 			serviceConfig.ExposeServiceTLS = value
 		case LabelServiceExposeIngressClassName:
@@ -815,13 +949,10 @@ func parseKomposeLabels(labels map[string]string, serviceConfig *kobject.Service
 		return errors.New("kompose.service.expose.ingress-class-name was specified without kompose.service.expose")
 	}
 
-	if serviceConfig.ServiceType != string(api.ServiceTypeNodePort) && serviceConfig.NodePortPort != 0 {
-		return errors.New("kompose.service.type must be nodeport when assign node port value")
-	}
-
-	if len(serviceConfig.Port) > 1 && serviceConfig.NodePortPort != 0 {
-		return errors.New("cannot set kompose.service.nodeport.port when service has multiple ports")
-	}
+	// Cross-label validation for nodePort assignment lives in the transformer
+	// (kubernetes.ValidateServicePorts): it needs the effective Service type after
+	// port derivation, and it returns every problem at once rather than aborting
+	// on the first one.
 
 	if serviceConfig.Restart == "always" && serviceConfig.CronJobConcurrencyPolicy != "" {
 		log.Infof("cronjob restart policy will be converted from '%s' to 'on-failure'", serviceConfig.Restart)
@@ -829,6 +960,41 @@ func parseKomposeLabels(labels map[string]string, serviceConfig *kobject.Service
 	}
 
 	return nil
+}
+
+// parseNodePortsLabel parses kompose.service.nodeport.ports, whose value maps a
+// container port to the nodePort to assign, e.g. "80:30080,443:30443".
+func parseNodePortsLabel(value string) (map[int32]int32, error) {
+	nodePorts := map[int32]int32{}
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nodePorts, nil
+	}
+
+	for _, entry := range strings.Split(trimmed, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		parts := strings.SplitN(entry, ":", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("entry %q must be in the form <container-port>:<node-port>", entry)
+		}
+		containerPort, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 32)
+		if err != nil || containerPort <= 0 || containerPort > 65535 {
+			return nil, fmt.Errorf("entry %q has an invalid container port", entry)
+		}
+		nodePort, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 32)
+		if err != nil || nodePort <= 0 || nodePort > 65535 {
+			return nil, fmt.Errorf("entry %q has an invalid node port", entry)
+		}
+		if _, exists := nodePorts[int32(containerPort)]; exists {
+			return nil, fmt.Errorf("container port %d is assigned a node port more than once", containerPort)
+		}
+		nodePorts[int32(containerPort)] = int32(nodePort)
+	}
+
+	return nodePorts, nil
 }
 
 func handleVolume(komposeObject *kobject.KomposeObject, volumes *types.Volumes) {

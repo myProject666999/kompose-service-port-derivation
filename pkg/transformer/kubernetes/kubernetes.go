@@ -695,10 +695,14 @@ func (k *Kubernetes) CreatePVC(name string, mode string, size string, selectorVa
 }
 
 // ConfigPorts configures the container ports.
+//
+// Ports declared with `mode: host` always become container hostPorts, because
+// that is the composition semantic closest to host publication. Other ports only
+// gain a hostPort when kompose.controller.port.expose asks for it.
 func ConfigPorts(service kobject.ServiceConfig) []api.ContainerPort {
 	var ports []api.ContainerPort
 	exist := map[string]bool{}
-	for _, port := range service.Port {
+	for _, port := range SortedPorts(service.Port) {
 		if exist[port.ID()] {
 			continue
 		}
@@ -707,7 +711,7 @@ func ConfigPorts(service kobject.ServiceConfig) []api.ContainerPort {
 			Protocol:      api.Protocol(port.Protocol),
 		}
 
-		if service.ExposeContainerToHost {
+		if service.ExposeContainerToHost || port.IsHostMode() {
 			containerPort.HostIP = port.HostIP
 			containerPort.HostPort = port.HostPort
 		}
@@ -718,68 +722,74 @@ func ConfigPorts(service kobject.ServiceConfig) []api.ContainerPort {
 	return ports
 }
 
-// ConfigLBServicePorts method configure the ports of the k8s Load Balancer Service
+// ConfigLBServicePorts configures the ports of the k8s Load Balancer Service.
+// A LoadBalancer is split into a TCP and a UDP Service (mixed protocols are not
+// allowed by most cloud providers), so each half names its ports among its own
+// ports only.
 func (k *Kubernetes) ConfigLBServicePorts(service kobject.ServiceConfig) ([]api.ServicePort, []api.ServicePort) {
-	var tcpPorts []api.ServicePort
-	var udpPorts []api.ServicePort
-	for _, port := range service.Port {
-		if port.HostPort == 0 {
-			port.HostPort = port.ContainerPort
-		}
-		var targetPort intstr.IntOrString
-		targetPort.IntVal = port.ContainerPort
-		targetPort.StrVal = strconv.Itoa(int(port.ContainerPort))
-
-		servicePort := api.ServicePort{
-			Name:       strconv.Itoa(int(port.HostPort)),
-			Port:       port.HostPort,
-			TargetPort: targetPort,
-		}
-
-		if protocol := api.Protocol(port.Protocol); protocol == api.ProtocolTCP {
-			// If the default is already TCP, no need to include protocol.
-			tcpPorts = append(tcpPorts, servicePort)
+	var tcpGroup []kobject.Ports
+	var udpGroup []kobject.Ports
+	for _, port := range servicePortsOf(service) {
+		if api.Protocol(port.Protocol) == api.ProtocolTCP {
+			tcpGroup = append(tcpGroup, port)
 		} else {
-			servicePort.Protocol = protocol
-			udpPorts = append(udpPorts, servicePort)
+			udpGroup = append(udpGroup, port)
 		}
 	}
-	return tcpPorts, udpPorts
+
+	build := func(group []kobject.Ports) []api.ServicePort {
+		var built []api.ServicePort
+		for _, port := range group {
+			var targetPort intstr.IntOrString
+			targetPort.IntVal = port.ContainerPort
+			targetPort.StrVal = strconv.Itoa(int(port.ContainerPort))
+
+			sp := api.ServicePort{
+				Name:       ServicePortName(port, group),
+				Port:       exposedPort(port),
+				TargetPort: targetPort,
+			}
+			// If the default is already TCP, no need to include protocol.
+			if protocol := api.Protocol(port.Protocol); protocol != api.ProtocolTCP {
+				sp.Protocol = protocol
+			}
+			built = append(built, sp)
+		}
+		return built
+	}
+
+	return build(tcpGroup), build(udpGroup)
 }
 
 // ConfigServicePorts configure the container service ports.
+//
+// Invalid input (mixed TCP/UDP on one LoadBalancer port, two container ports
+// sharing a service port, ...) is reported by ValidateServicePorts during
+// Transform; this function only builds the objects.
 func (k *Kubernetes) ConfigServicePorts(service kobject.ServiceConfig) []api.ServicePort {
 	servicePorts := []api.ServicePort{}
-	seenPorts := make(map[int]struct{}, len(service.Port))
+	ports := servicePortsOf(service)
 
 	var servicePort api.ServicePort
-	for _, port := range service.Port {
-		if port.HostPort == 0 {
-			port.HostPort = port.ContainerPort
-		}
+	for _, port := range ports {
+		exposed := exposedPort(port)
 
 		var targetPort intstr.IntOrString
 		targetPort.IntVal = port.ContainerPort
 		targetPort.StrVal = strconv.Itoa(int(port.ContainerPort))
 
-		// decide the name based on whether we saw this port before
-		name := strconv.Itoa(int(port.HostPort))
-		if _, ok := seenPorts[int(port.HostPort)]; ok {
-			// https://github.com/kubernetes/kubernetes/issues/2995
-			if service.ServiceType == string(api.ServiceTypeLoadBalancer) {
-				log.Fatalf("Service %s of type LoadBalancer cannot use TCP and UDP for the same port", name)
-			}
-			name = fmt.Sprintf("%s-%s", name, strings.ToLower(port.Protocol))
-		}
-
 		servicePort = api.ServicePort{
-			Name:       name,
-			Port:       port.HostPort,
+			Name:       ServicePortName(port, ports),
+			Port:       exposed,
 			TargetPort: targetPort,
 		}
 
-		if service.ServiceType == string(api.ServiceTypeNodePort) && service.NodePortPort != 0 {
-			servicePort.NodePort = service.NodePortPort
+		if service.ServiceType == string(api.ServiceTypeNodePort) {
+			if nodePort, ok := service.NodePortPorts[port.ContainerPort]; ok {
+				servicePort.NodePort = nodePort
+			} else if service.NodePortPort != 0 && len(ports) == 1 {
+				servicePort.NodePort = service.NodePortPort
+			}
 		}
 
 		// If the default is already TCP, no need to include protocol.
@@ -788,7 +798,6 @@ func (k *Kubernetes) ConfigServicePorts(service kobject.ServiceConfig) []api.Ser
 		}
 
 		servicePorts = append(servicePorts, servicePort)
-		seenPorts[int(port.HostPort)] = struct{}{}
 	}
 	return servicePorts
 }
@@ -1493,7 +1502,7 @@ func buildServiceImage(opt kobject.ConvertOptions, service kobject.ServiceConfig
 
 func (k *Kubernetes) configKubeServiceAndIngressForService(service kobject.ServiceConfig, name string, objects *[]runtime.Object) {
 	if k.PortsExist(service) {
-		if service.ServiceType == "LoadBalancer" {
+		if service.ServiceType == string(api.ServiceTypeLoadBalancer) {
 			svcs := k.CreateLBService(name, service)
 			for _, svc := range svcs {
 				svc.Spec.ExternalTrafficPolicy = api.ServiceExternalTrafficPolicyType(service.ServiceExternalTrafficPolicy)
@@ -1502,27 +1511,58 @@ func (k *Kubernetes) configKubeServiceAndIngressForService(service kobject.Servi
 			if len(svcs) > 1 {
 				log.Warningf("Create multiple service to avoid using mixed protocol in the same service when it's loadbalancer type")
 			}
-		} else {
-			svc := k.CreateService(name, service)
-			*objects = append(*objects, svc)
-			if service.ExposeService != "" {
-				*objects = append(*objects, k.initIngress(name, service, svc.Spec.Ports[0].Port))
-			}
-			if service.ServiceExternalTrafficPolicy != "" && svc.Spec.Type != api.ServiceTypeNodePort {
-				log.Warningf("External Traffic Policy is ignored for the service %v of type %v", name, service.ServiceType)
-			}
-		}
-	} else {
-		if service.ServiceType == "Headless" {
+		} else if service.ServiceType == serviceTypeHeadless && !HasServicePorts(service) {
+			// Nothing to put in the Service: a headless Service without ports,
+			// carrying the documented placeholder port.
 			svc := k.CreateHeadlessService(name, service)
 			*objects = append(*objects, svc)
 			if service.ServiceExternalTrafficPolicy != "" {
-				log.Warningf("External Traffic Policy is ignored for the service %v of type Headless", name)
+				log.Warningf("External Traffic Policy is ignored for the service %v of type Headless (label value %q)", name, service.ServiceExternalTrafficPolicy)
+			}
+		} else {
+			svc := k.CreateService(name, service)
+			*objects = append(*objects, svc)
+			if service.ExposeService != "" && len(svc.Spec.Ports) > 0 {
+				*objects = append(*objects, k.initIngress(name, service, svc.Spec.Ports[0].Port))
+			}
+			if service.ServiceExternalTrafficPolicy != "" && svc.Spec.Type != api.ServiceTypeNodePort {
+				log.Warningf("External Traffic Policy is ignored for the service %v of type %v (label value %q)", name, service.ServiceType, service.ServiceExternalTrafficPolicy)
+			}
+		}
+	} else {
+		if service.ServiceType == serviceTypeHeadless {
+			svc := k.CreateHeadlessService(name, service)
+			*objects = append(*objects, svc)
+			if service.ServiceExternalTrafficPolicy != "" {
+				log.Warningf("External Traffic Policy is ignored for the service %v of type Headless (label value %q)", name, service.ServiceExternalTrafficPolicy)
 			}
 		} else {
 			log.Warnf("Service %q won't be created because 'ports' is not specified", service.Name)
 		}
 	}
+}
+
+// serviceTypeIssues describes port problems that only become visible once the
+// controller has been resolved (a kompose.controller.type label can turn a
+// service into a StatefulSet inside CreateWorkloadAndConfigMapObjects). The
+// pre-pass in Transform cannot know the label-driven controller, so each service
+// is re-checked here with the controller actually used for it.
+func serviceTypeIssues(service kobject.ServiceConfig, controller string) []kobject.PortIssue {
+	if controller != StatefulStateController || service.ServiceType == serviceTypeHeadless {
+		return nil
+	}
+	severity := kobject.PortIssueInfo
+	detail := "replacing the derived service type"
+	if service.ServiceTypeExplicit {
+		severity = kobject.PortIssueWarning
+		detail = "overriding the requested service type"
+	}
+	return []kobject.PortIssue{{
+		Severity: severity,
+		Category: kobject.PortCategoryDerivation,
+		Service:  service.Name,
+		Message:  fmt.Sprintf("controller statefulset requires a Headless Service; %s %q", detail, service.ServiceType),
+	}}
 }
 
 func (k *Kubernetes) configNetworkPolicyForService(service kobject.ServiceConfig, name string, objects *[]runtime.Object) error {
@@ -1543,6 +1583,20 @@ func (k *Kubernetes) configNetworkPolicyForService(service kobject.ServiceConfig
 // Transform maps komposeObject to k8s objects
 // returns object that are already sorted in the way that Services are first
 func (k *Kubernetes) Transform(komposeObject kobject.KomposeObject, opt kobject.ConvertOptions) ([]runtime.Object, error) {
+	// Validate and resolve every service's ports up front. Doing it once, before
+	// any object is built, lets a single conversion report all port problems
+	// instead of failing on whichever service happens to be processed first.
+	// The resolved Service type is written back so the builders below see it.
+	var portIssues []kobject.PortIssue
+	for _, name := range SortedKeys(komposeObject.ServiceConfigs) {
+		service := komposeObject.ServiceConfigs[name]
+		portIssues = append(portIssues, ValidateServicePorts(&service, opt)...)
+		komposeObject.ServiceConfigs[name] = service
+	}
+	if err := LogPortIssues(portIssues); err != nil {
+		return nil, err
+	}
+
 	// this will hold all the converted data
 	var allobjects []runtime.Object
 
@@ -1704,7 +1758,10 @@ func (k *Kubernetes) Transform(komposeObject kobject.KomposeObject, opt kobject.
 			objects = k.CreateWorkloadAndConfigMapObjects(name, service, opt)
 		}
 		if opt.Controller == StatefulStateController {
-			service.ServiceType = "Headless"
+			for _, issue := range serviceTypeIssues(service, opt.Controller) {
+				LogPortIssues([]kobject.PortIssue{issue})
+			}
+			service.ServiceType = serviceTypeHeadless
 		}
 		k.configKubeServiceAndIngressForService(service, name, &objects)
 		err := k.UpdateKubernetesObjects(name, service, opt, &objects)

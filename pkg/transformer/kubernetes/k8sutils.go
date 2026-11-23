@@ -420,9 +420,11 @@ func convertToVersion(obj runtime.Object) (runtime.Object, error) {
 	//return convertedObject, nil
 }
 
-// PortsExist checks if service has ports defined
+// PortsExist checks if service has ports that can be expressed in a Service.
+// Ports declared with `mode: host` become container hostPorts and do not count,
+// because a non-headless Service without ports is invalid.
 func (k *Kubernetes) PortsExist(service kobject.ServiceConfig) bool {
-	return len(service.Port) != 0
+	return HasServicePorts(service)
 }
 
 func (k *Kubernetes) initSvcObject(name string, service kobject.ServiceConfig, ports []api.ServicePort) *api.Service {
@@ -464,7 +466,7 @@ func (k *Kubernetes) CreateService(name string, service kobject.ServiceConfig) *
 	servicePorts := k.ConfigServicePorts(service)
 	svc.Spec.Ports = servicePorts
 
-	if service.ServiceType == "Headless" {
+	if service.ServiceType == serviceTypeHeadless {
 		svc.Spec.Type = api.ServiceTypeClusterIP
 		svc.Spec.ClusterIP = "None"
 	} else {
@@ -483,15 +485,25 @@ func (k *Kubernetes) CreateService(name string, service kobject.ServiceConfig) *
 // and without Service Pods can't find each other using DNS names.
 // Instead of regular Kubernetes Service we create Headless Service. DNS of such service points directly to Pod IP address.
 // You can find more about Headless Services in Kubernetes documentation https://kubernetes.io/docs/user-guide/services/#headless-services
+//
+// When the service does declare real ports, those are used verbatim: a headless
+// Service exposes its ports through SRV records and Endpoints, so the ports are
+// meaningful and the `headless` placeholder would only add noise. The placeholder
+// is kept solely for port-less services, where it works around
+// https://github.com/kubernetes/kubernetes/issues/32766.
 func (k *Kubernetes) CreateHeadlessService(name string, service kobject.ServiceConfig) *api.Service {
 	svc := k.InitSvc(name, service)
 
 	var servicePorts []api.ServicePort
-	// Configure a dummy port: https://github.com/kubernetes/kubernetes/issues/32766.
-	servicePorts = append(servicePorts, api.ServicePort{
-		Name: "headless",
-		Port: 55555,
-	})
+	if HasServicePorts(service) {
+		servicePorts = k.ConfigServicePorts(service)
+	} else {
+		// Configure a dummy port: https://github.com/kubernetes/kubernetes/issues/32766.
+		servicePorts = append(servicePorts, api.ServicePort{
+			Name: "headless",
+			Port: 55555,
+		})
+	}
 
 	svc.Spec.Ports = servicePorts
 	svc.Spec.ClusterIP = "None"

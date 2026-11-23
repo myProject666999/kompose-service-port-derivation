@@ -65,8 +65,10 @@ os_cmd="kompose --provider=openshift -f $KOMPOSE_ROOT/script/test/fixtures/$DIR/
 k8s_output="$KOMPOSE_ROOT/script/test/fixtures/$DIR/output-k8s.yaml"
 os_output="$KOMPOSE_ROOT/script/test/fixtures/$DIR/output-os.yaml"
 
-convert::expect_success_and_warning "$k8s_cmd" "$k8s_output"
-convert::expect_success_and_warning "$os_cmd" "$os_output"
+# The fixture binds published ports to 127.0.0.1; that is now reported as a
+# port-exposure warning because a Service exposes the port cluster-wide.
+convert::expect_success_and_warning "$k8s_cmd" "$k8s_output" "port-exposure"
+convert::expect_success_and_warning "$os_cmd" "$os_output" "port-exposure"
 
 
 
@@ -272,8 +274,11 @@ k8s_cmd="kompose -f $KOMPOSE_ROOT/script/test/fixtures/host-port-protocol/compos
 os_cmd="kompose --provider=openshift -f $KOMPOSE_ROOT/script/test/fixtures/host-port-protocol/compose.yaml convert --stdout --with-kompose-annotation=false"
 k8s_output="$KOMPOSE_ROOT/script/test/fixtures/host-port-protocol/output-k8s.yaml"
 os_output="$KOMPOSE_ROOT/script/test/fixtures/host-port-protocol/output-os.yaml"
-convert::expect_success "$k8s_cmd" "$k8s_output" || exit 1
-convert::expect_success "$os_cmd" "$os_output" || exit 1
+# `mode: host` becomes a container hostPort and is intentionally left out of the
+# Service, so the conversion notes that it dropped the port from the Service and
+# warns that no Service could be created.
+convert::expect_success_and_warning "$k8s_cmd" "$k8s_output" "mode: host" || exit 1
+convert::expect_success_and_warning "$os_cmd" "$os_output" "mode: host" || exit 1
 
 # Test external traffic policy feature with valid configuration, warning is coming from the network policy.
 k8s_cmd="kompose -f $KOMPOSE_ROOT/script/test/fixtures/external-traffic-policy/compose-v1.yaml convert --stdout --with-kompose-annotation=false"

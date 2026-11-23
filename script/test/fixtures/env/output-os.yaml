@@ -7,12 +7,12 @@ metadata:
   name: another-namenode
 spec:
   ports:
-    - name: "50070"
-      port: 50070
-      targetPort: 50070
     - name: "8020"
       port: 8020
       targetPort: 8020
+    - name: "50070"
+      port: 50070
+      targetPort: 50070
   selector:
     io.kompose.service: another-namenode
 
@@ -25,12 +25,12 @@ metadata:
   name: namenode
 spec:
   ports:
-    - name: "50070"
-      port: 50070
-      targetPort: 50070
     - name: "8020"
       port: 8020
       targetPort: 8020
+    - name: "50070"
+      port: 50070
+      targetPort: 50070
   selector:
     io.kompose.service: namenode
 
@@ -68,9 +68,9 @@ spec:
           image: ' '
           name: another-namenode
           ports:
-            - containerPort: 50070
-              protocol: TCP
             - containerPort: 8020
+              protocol: TCP
+            - containerPort: 50070
               protocol: TCP
       restartPolicy: Always
   test: false
@@ -129,9 +129,9 @@ spec:
           image: ' '
           name: namenode
           ports:
-            - containerPort: 50070
-              protocol: TCP
             - containerPort: 8020
+              protocol: TCP
+            - containerPort: 50070
               protocol: TCP
       restartPolicy: Always
   test: false

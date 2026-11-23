@@ -134,6 +134,8 @@ Labels are an important kompose concept as they allow you to add Kubernetes modi
 | `Duration` | `5s` |
 | [`kompose.service.nodeport.port`](#komposeservicenodeportport) | Specific port number to be used as NodePort |
 | `Integer` | `30000` |
+| [`kompose.service.nodeport.ports`](#komposeservicenodeportports) | NodePort per container port, for multi-port services |
+| `String` | `80:30080,443:30443` |
 | [`kompose.service.type`](#komposeservicetype) | Type of service |
 | `String` | `nodeport`, `clusterip`, `loadbalancer`, `headless` |
 | [`kompose.volume.size`](#komposevolumesize) | Size of the volume |
@@ -505,6 +507,34 @@ services:
       kompose.service.nodeport.port: 30000
 ```
 
+The value must lie in the nodePort range kompose accepts. That range defaults to
+the Kubernetes default, `30000-32767`, and can be changed with
+`--nodeport-range-min` / `--nodeport-range-max` when the API server was started
+with a different `--service-node-port-range`. A value outside the range is an
+error, not output as-is. This label only works for single-port services; use
+`kompose.service.nodeport.ports` for services with several ports.
+
+### kompose.service.nodeport.ports
+
+```yaml
+services:
+  web:
+    image: nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    labels:
+      kompose.service.type: nodeport
+      kompose.service.nodeport.ports: "80:30080,443:30443"
+```
+
+The value maps container ports to nodePorts, separated by commas, with the
+container port as the key. It is an alternative to `kompose.service.nodeport.port`;
+setting both on one service is an error. Each nodePort is validated against the
+same configurable range as `kompose.service.nodeport.port`. Two ports may share a
+nodePort only when their protocols differ (TCP versus UDP), which is the same
+rule Kubernetes applies.
+
 ### kompose.service.type
 
 ```yaml
@@ -516,6 +546,25 @@ services:
     labels:
       kompose.service.type: nodeport
 ```
+
+An explicit `kompose.service.type` always wins over anything derived from ports.
+When the label (and `deploy.endpoint_mode`) is absent, the Service is a
+ClusterIP, and the ports only populate its port list.
+
+With `--derive-service-type-from-ports`, kompose derives the type from the port
+declarations instead: a service that publishes at least one port derives
+`NodePort`, and a service with only `expose` entries or container ports stays
+`ClusterIP`. The two exceptions, both kept from earlier behaviour, are:
+
+- `deploy.endpoint_mode: vip` maps to `NodePort` (Swarm's virtual IP is closer to
+  a ClusterIP than to a node port; this mapping predates kompose and is retained
+  for compatibility);
+- `deploy.endpoint_mode: dnsrr` maps to `Headless`, since it bypasses the virtual
+  IP and returns task addresses directly.
+
+A StatefulSet controller always needs a Headless Service. When the requested
+type conflicts, the controller wins and kompose reports the override; a type
+written by the user is never replaced silently.
 
 ### kompose.volume.size
 

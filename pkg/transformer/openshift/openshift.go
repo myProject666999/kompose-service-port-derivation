@@ -257,6 +257,19 @@ func (o *OpenShift) Transform(komposeObject kobject.KomposeObject, opt kobject.C
 	for _, keyName := range noSupKeys {
 		log.Warningf("OpenShift provider doesn't support %s key - ignoring", keyName)
 	}
+
+	// Same port validation pass as the Kubernetes transformer; the port building
+	// helpers are shared, so OpenShift inherits every rule.
+	var portIssues []kobject.PortIssue
+	for _, name := range kubernetes.SortedKeys(komposeObject.ServiceConfigs) {
+		service := komposeObject.ServiceConfigs[name]
+		portIssues = append(portIssues, kubernetes.ValidateServicePorts(&service, opt)...)
+		komposeObject.ServiceConfigs[name] = service
+	}
+	if err := kubernetes.LogPortIssues(portIssues); err != nil {
+		return nil, err
+	}
+
 	// this will hold all the converted data
 	var allobjects []runtime.Object
 
@@ -398,7 +411,7 @@ func (o *OpenShift) Transform(komposeObject kobject.KomposeObject, opt kobject.C
 		}
 
 		if o.PortsExist(service) {
-			if service.ServiceType == "LoadBalancer" {
+			if service.ServiceType == string(corev1.ServiceTypeLoadBalancer) {
 				svcs := o.CreateLBService(name, service)
 				for _, svc := range svcs {
 					svc.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyType(service.ServiceExternalTrafficPolicy)
@@ -407,22 +420,30 @@ func (o *OpenShift) Transform(komposeObject kobject.KomposeObject, opt kobject.C
 				if len(svcs) > 1 {
 					log.Warningf("Create multiple service to avoid using mixed protocol in the same service when it's loadbalancer type")
 				}
+			} else if service.ServiceType == kubernetes.ServiceTypeHeadless {
+				// Headless services with real ports keep them (SRV records and
+				// Endpoints depend on them), exactly like the Kubernetes provider.
+				svc := o.CreateHeadlessService(name, service)
+				objects = append(objects, svc)
+				if service.ServiceExternalTrafficPolicy != "" {
+					log.Warningf("External Traffic Policy is ignored for the service %v of type Headless (label value %q)", name, service.ServiceExternalTrafficPolicy)
+				}
 			} else {
 				svc := o.CreateService(name, service)
 				objects = append(objects, svc)
 
-				if service.ExposeService != "" {
+				if service.ExposeService != "" && len(svc.Spec.Ports) > 0 {
 					objects = append(objects, o.initRoute(name, service, svc.Spec.Ports[0].Port))
 				}
 				if service.ServiceExternalTrafficPolicy != "" && svc.Spec.Type != corev1.ServiceTypeNodePort {
-					log.Warningf("External Traffic Policy is ignored for the service %v of type %v", name, service.ServiceType)
+					log.Warningf("External Traffic Policy is ignored for the service %v of type %v (label value %q)", name, service.ServiceType, service.ServiceExternalTrafficPolicy)
 				}
 			}
-		} else if service.ServiceType == "Headless" {
+		} else if service.ServiceType == kubernetes.ServiceTypeHeadless {
 			svc := o.CreateHeadlessService(name, service)
 			objects = append(objects, svc)
 			if service.ServiceExternalTrafficPolicy != "" {
-				log.Warningf("External Traffic Policy is ignored for the service %v of type Headless", name)
+				log.Warningf("External Traffic Policy is ignored for the service %v of type Headless (label value %q)", name, service.ServiceExternalTrafficPolicy)
 			}
 		}
 

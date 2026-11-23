@@ -7,12 +7,12 @@ metadata:
   name: another-namenode
 spec:
   ports:
-    - name: "50070"
-      port: 50070
-      targetPort: 50070
     - name: "8020"
       port: 8020
       targetPort: 8020
+    - name: "50070"
+      port: 50070
+      targetPort: 50070
   selector:
     io.kompose.service: another-namenode
 
@@ -25,12 +25,12 @@ metadata:
   name: namenode
 spec:
   ports:
-    - name: "50070"
-      port: 50070
-      targetPort: 50070
     - name: "8020"
       port: 8020
       targetPort: 8020
+    - name: "50070"
+      port: 50070
+      targetPort: 50070
   selector:
     io.kompose.service: namenode
 
@@ -58,9 +58,9 @@ spec:
           image: bde2020/hadoop-namenode:2.0.0-hadoop2.7.4-java8
           name: another-namenode
           ports:
-            - containerPort: 50070
-              protocol: TCP
             - containerPort: 8020
+              protocol: TCP
+            - containerPort: 50070
               protocol: TCP
       restartPolicy: Always
 
@@ -102,9 +102,9 @@ spec:
           image: bde2020/hadoop-namenode:2.0.0-hadoop2.7.4-java8
           name: namenode
           ports:
-            - containerPort: 50070
-              protocol: TCP
             - containerPort: 8020
+              protocol: TCP
+            - containerPort: 50070
               protocol: TCP
       restartPolicy: Always
 

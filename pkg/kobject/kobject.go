@@ -19,6 +19,7 @@ package kobject
 import (
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/compose-spec/compose-go/v2/types"
@@ -93,6 +94,16 @@ type ConvertOptions struct {
 	SecretsAsFiles          bool
 	GenerateNetworkPolicies bool
 	NoInterpolate           bool
+
+	// DeriveServiceTypeFromPorts enables deriving the Service type from the
+	// published ports of a service that does not carry an explicit
+	// kompose.service.type label (or deploy.endpoint_mode). It is off by default
+	// so existing conversions keep producing ClusterIP.
+	DeriveServiceTypeFromPorts bool
+	// NodePortRange bounds the nodePort values kompose accepts. Zero bounds fall
+	// back to the Kubernetes default range (30000-32767); a cluster started with
+	// a different --service-node-port-range can be described here.
+	NodePortRange PortRange
 }
 
 // IsPodController indicate if the user want to use a controller
@@ -106,40 +117,49 @@ type ServiceConfigGroup []ServiceConfig
 // ServiceConfig holds the basic struct of a container
 // which should not introduce any kubernetes specific struct
 type ServiceConfig struct {
-	Name                          string
-	ContainerName                 string
-	Image                         string             `compose:"image"`
-	Environment                   []EnvVar           `compose:"environment"`
-	EnvFile                       []string           `compose:"env_file"`
-	Port                          []Ports            `compose:"ports"`
-	Command                       []string           `compose:"command"`
-	WorkingDir                    string             `compose:""`
-	DomainName                    string             `compose:"domainname"`
-	HostName                      string             `compose:"hostname"`
-	ReadOnly                      bool               `compose:"read_only"`
-	Args                          []string           `compose:"args"`
-	VolList                       []string           `compose:"volumes"`
-	NetworkMode                   string             `compose:"network_mode"`
-	Network                       []string           `compose:"network"`
-	Labels                        map[string]string  `compose:"labels"`
-	Annotations                   map[string]string  `compose:""`
-	CPUSet                        string             `compose:"cpuset"`
-	CPUShares                     int64              `compose:"cpu_shares"`
-	CPUQuota                      int64              `compose:"cpu_quota"`
-	CPULimit                      int64              `compose:""`
-	CPUReservation                int64              `compose:""`
-	CapAdd                        []string           `compose:"cap_add"`
-	CapDrop                       []string           `compose:"cap_drop"`
-	Expose                        []string           `compose:"expose"`
-	ImagePullPolicy               string             `compose:"kompose.image-pull-policy"`
-	Pid                           string             `compose:"pid"`
-	Privileged                    bool               `compose:"privileged"`
-	Restart                       string             `compose:"restart"`
-	User                          string             `compose:"user"`
-	VolumesFrom                   []string           `compose:"volumes_from"`
-	ServiceType                   string             `compose:"kompose.service.type"`
-	ServiceExternalTrafficPolicy  string             `compose:"kompose.service.external-traffic-policy"`
-	NodePortPort                  int32              `compose:"kompose.service.nodeport.port"`
+	Name                         string
+	ContainerName                string
+	Image                        string            `compose:"image"`
+	Environment                  []EnvVar          `compose:"environment"`
+	EnvFile                      []string          `compose:"env_file"`
+	Port                         []Ports           `compose:"ports"`
+	Command                      []string          `compose:"command"`
+	WorkingDir                   string            `compose:""`
+	DomainName                   string            `compose:"domainname"`
+	HostName                     string            `compose:"hostname"`
+	ReadOnly                     bool              `compose:"read_only"`
+	Args                         []string          `compose:"args"`
+	VolList                      []string          `compose:"volumes"`
+	NetworkMode                  string            `compose:"network_mode"`
+	Network                      []string          `compose:"network"`
+	Labels                       map[string]string `compose:"labels"`
+	Annotations                  map[string]string `compose:""`
+	CPUSet                       string            `compose:"cpuset"`
+	CPUShares                    int64             `compose:"cpu_shares"`
+	CPUQuota                     int64             `compose:"cpu_quota"`
+	CPULimit                     int64             `compose:""`
+	CPUReservation               int64             `compose:""`
+	CapAdd                       []string          `compose:"cap_add"`
+	CapDrop                      []string          `compose:"cap_drop"`
+	Expose                       []string          `compose:"expose"`
+	ImagePullPolicy              string            `compose:"kompose.image-pull-policy"`
+	Pid                          string            `compose:"pid"`
+	Privileged                   bool              `compose:"privileged"`
+	Restart                      string            `compose:"restart"`
+	User                         string            `compose:"user"`
+	VolumesFrom                  []string          `compose:"volumes_from"`
+	ServiceType                  string            `compose:"kompose.service.type"`
+	ServiceExternalTrafficPolicy string            `compose:"kompose.service.external-traffic-policy"`
+	NodePortPort                 int32             `compose:"kompose.service.nodeport.port"`
+	// NodePortPorts maps a container port (the key, as documented for the
+	// kompose.service.nodeport.ports label) to the nodePort to assign to it.
+	// It coexists with the legacy single NodePortPort field; using both for one
+	// service is rejected while parsing the labels.
+	NodePortPorts map[int32]int32
+	// ServiceTypeExplicit records that ServiceType came from user input (a
+	// kompose.service.type label or a compose deploy.endpoint_mode) rather than
+	// from port derivation. Derived types never override such a value.
+	ServiceTypeExplicit           bool
 	StopGracePeriod               string             `compose:"stop_grace_period"`
 	Build                         string             `compose:"build"`
 	BuildArgs                     map[string]*string `compose:"build-args"`
@@ -178,7 +198,12 @@ type ServiceConfig struct {
 	ConfigsMetaData types.Configs `compose:""`
 
 	WithKomposeAnnotation bool `compose:""`
-	InGroup               bool
+	InGroup               bool `compose:""`
+
+	// PortIssues collects port-related diagnostics discovered while loading the
+	// compose file. The loader cannot emit them itself in a testable way, so the
+	// transformer both logs them and fails on the errors it finds here.
+	PortIssues []PortIssue `compose:"-"`
 }
 
 // HealthChecks used to distinguish between liveness and readiness
@@ -214,11 +239,108 @@ type Ports struct {
 	ContainerPort int32
 	HostIP        string
 	Protocol      string // Upper string
+	// Mode is the compose `mode` of the port declaration. "host" means the
+	// binding is published directly on the host (closest to a Kubernetes
+	// hostPort); "ingress" (the default) means it is routed by the platform
+	// (closest to a Kubernetes Service port).
+	Mode string
 }
 
 // ID returns an unique id for this port settings, to avoid conflict
 func (port *Ports) ID() string {
 	return strconv.Itoa(int(port.ContainerPort)) + port.Protocol
+}
+
+// IsHostMode reports whether the port declaration asked for host-level
+// publication (compose `mode: host`).
+func (port *Ports) IsHostMode() bool {
+	return strings.EqualFold(port.Mode, PortModeHost)
+}
+
+// Port modes understood by the compose loader.
+const (
+	PortModeHost    = "host"
+	PortModeIngress = "ingress"
+)
+
+// PortIssueSeverity classifies a port diagnosis.
+type PortIssueSeverity string
+
+const (
+	// PortIssueInfo is an informational note about a port decision.
+	PortIssueInfo PortIssueSeverity = "info"
+	// PortIssueWarning is a problem that does not stop the conversion.
+	PortIssueWarning PortIssueSeverity = "warning"
+	// PortIssueError is a problem that must fail the conversion.
+	PortIssueError PortIssueSeverity = "error"
+)
+
+// Port diagnostic categories. They intentionally cover port problems only;
+// kompose has no global diagnostic taxonomy and this is not meant to become one.
+const (
+	// PortCategoryRange covers invalid or out-of-range port numbers.
+	PortCategoryRange = "port-range"
+	// PortCategoryExposure covers widened exposure (loopback bindings, etc).
+	PortCategoryExposure = "port-exposure"
+	// PortCategoryConflict covers duplicate names/ports/nodePorts and mixed protocols.
+	PortCategoryConflict = "port-conflict"
+	// PortCategoryMode covers compose `mode` semantics.
+	PortCategoryMode = "port-mode"
+	// PortCategoryDerivation covers how a Service type was derived.
+	PortCategoryDerivation = "port-derivation"
+)
+
+// PortIssue is a single port-related diagnosis for one service.
+type PortIssue struct {
+	Severity PortIssueSeverity
+	Category string
+	Service  string
+	Message  string
+}
+
+// String renders the issue with its category and service name.
+func (i PortIssue) String() string {
+	return "[" + i.Category + "] service " + strconv.Quote(i.Service) + ": " + i.Message
+}
+
+// DefaultNodePortRangeMin and DefaultNodePortRangeMax are the nodePort bounds
+// Kubernetes clusters use unless the API server was started with a different
+// --service-node-port-range. kompose validates against the default range unless
+// the user supplies another one.
+const (
+	DefaultNodePortRangeMin int32 = 30000
+	DefaultNodePortRangeMax int32 = 32767
+)
+
+// PortRange is an inclusive port range, used to bound nodePort values.
+type PortRange struct {
+	Min int32
+	Max int32
+}
+
+// Resolved returns the configured range, falling back to the Kubernetes default
+// when either bound is unset.
+func (r PortRange) Resolved() PortRange {
+	resolved := r
+	if resolved.Min == 0 {
+		resolved.Min = DefaultNodePortRangeMin
+	}
+	if resolved.Max == 0 {
+		resolved.Max = DefaultNodePortRangeMax
+	}
+	return resolved
+}
+
+// Contains reports whether port falls inside the resolved range.
+func (r PortRange) Contains(port int32) bool {
+	resolved := r.Resolved()
+	return port >= resolved.Min && port <= resolved.Max
+}
+
+// String renders the range as "min-max".
+func (r PortRange) String() string {
+	resolved := r.Resolved()
+	return strconv.Itoa(int(resolved.Min)) + "-" + strconv.Itoa(int(resolved.Max))
 }
 
 // Volumes holds the volume struct of container

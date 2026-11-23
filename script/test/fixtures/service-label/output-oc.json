@@ -14,7 +14,7 @@
         },
         "annotations": {
           "kompose.cmd": "%CMD%",
-          "kompose.service.nodeport.port": "33111",
+          "kompose.service.nodeport.port": "30111",
           "kompose.service.type": "nodeport",
           "kompose.version": "%VERSION%"
         }
@@ -25,7 +25,7 @@
             "name": "3306",
             "port": 3306,
             "targetPort": 3306,
-            "nodePort": 33111
+            "nodePort": 30111
           }
         ],
         "selector": {
@@ -48,7 +48,7 @@
         },
         "annotations": {
           "kompose.cmd": "%CMD%",
-          "kompose.service.nodeport.port": "33111",
+          "kompose.service.nodeport.port": "30111",
           "kompose.service.type": "nodeport",
           "kompose.version": "%VERSION%"
         }

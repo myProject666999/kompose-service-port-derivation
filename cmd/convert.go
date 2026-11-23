@@ -77,6 +77,16 @@ var (
 	// be the default for kompose, but we must keep compatibility with the previous behavior.
 	// See https://github.com/kubernetes/kompose/issues/1280 for more details.
 	SecretsAsFiles bool
+
+	// DeriveServiceTypeFromPorts enables deriving NodePort/ClusterIP from the
+	// published ports of services without an explicit kompose.service.type label.
+	// Off by default so existing conversions keep producing ClusterIP.
+	DeriveServiceTypeFromPorts bool
+
+	// NodePortRange bounds the nodePort values kompose accepts. Zero values fall
+	// back to the Kubernetes default range (30000-32767).
+	NodePortRangeMin int
+	NodePortRangeMax int
 )
 
 var convertCmd = &cobra.Command{
@@ -133,6 +143,11 @@ var convertCmd = &cobra.Command{
 			BuildCommand:                BuildCommand,
 			PushCommand:                 PushCommand,
 			Namespace:                   ConvertNamespace,
+			DeriveServiceTypeFromPorts:  DeriveServiceTypeFromPorts,
+			NodePortRange: kobject.PortRange{
+				Min: int32(NodePortRangeMin),
+				Max: int32(NodePortRangeMax),
+			},
 		}
 
 		if ServiceGroupMode == "" && MultipleContainerMode {
@@ -207,6 +222,10 @@ func init() {
 
 	convertCmd.Flags().BoolVar(&WithKomposeAnnotation, "with-kompose-annotation", true, "Add kompose annotations to generated resource")
 	convertCmd.Flags().BoolVar(&NoInterpolate, "no-interpolate", false, "Keep environment variable names in the Compose file")
+
+	convertCmd.Flags().BoolVar(&DeriveServiceTypeFromPorts, "derive-service-type-from-ports", false, "Derive NodePort/ClusterIP from published ports for services without a kompose.service.type label")
+	convertCmd.Flags().IntVar(&NodePortRangeMin, "nodeport-range-min", int(kobject.DefaultNodePortRangeMin), "Lower bound of the nodePort range accepted from kompose.service.nodeport.port(s)")
+	convertCmd.Flags().IntVar(&NodePortRangeMax, "nodeport-range-max", int(kobject.DefaultNodePortRangeMax), "Upper bound of the nodePort range accepted from kompose.service.nodeport.port(s)")
 
 	// Deprecated commands
 	convertCmd.Flags().BoolVar(&ConvertEmptyVols, "emptyvols", false, "Use Empty Volumes. Do not generate PVCs")

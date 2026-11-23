@@ -220,8 +220,8 @@ func TestLoadV3Ports(t *testing.T) {
 			ports:  []types.ServicePortConfig{{Target: 80, Published: "80", Protocol: string(api.ProtocolTCP)}},
 			expose: []string{"80", "8080"},
 			want: []kobject.Ports{
-				{HostPort: 80, ContainerPort: 80, Protocol: string(api.ProtocolTCP)},
-				{ContainerPort: 8080, Protocol: string(api.ProtocolTCP)},
+				{HostPort: 80, ContainerPort: 80, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
+				{ContainerPort: 8080, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
 			},
 		},
 		{
@@ -229,15 +229,18 @@ func TestLoadV3Ports(t *testing.T) {
 			ports:  []types.ServicePortConfig{{Target: 80, Published: "80", Protocol: string(api.ProtocolTCP)}},
 			expose: []string{"80/udp"},
 			want: []kobject.Ports{
-				{HostPort: 80, ContainerPort: 80, Protocol: string(api.ProtocolTCP)},
-				{ContainerPort: 80, Protocol: string(api.ProtocolUDP)},
+				{HostPort: 80, ContainerPort: 80, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
+				{ContainerPort: 80, Protocol: string(api.ProtocolUDP), Mode: kobject.PortModeIngress},
 			},
 		},
 	} {
 		t.Run(tt.desc, func(t *testing.T) {
-			got := loadPorts(tt.ports, tt.expose)
+			got, issues := loadPorts("web", tt.ports, tt.expose)
 			if diff := cmp.Diff(tt.want, got); diff != "" {
 				t.Errorf("loadV3Ports() mismatch (-want +got):\n%s", diff)
+			}
+			if len(issues) != 0 {
+				t.Errorf("loadV3Ports() unexpected issues: %v", issues)
 			}
 		})
 	}
@@ -285,79 +288,90 @@ func TestLoadPorts(t *testing.T) {
 		ports  []types.ServicePortConfig
 		expose []string
 		want   []kobject.Ports
+		// issues, when non-nil, are the only issues expected. A nil value means
+		// "expect no issues at all".
+		issues []kobject.PortIssue
 	}{
 		{
 			ports: portWithIPAddress,
 			want: []kobject.Ports{
-				{HostIP: "127.0.0.1", HostPort: 80, ContainerPort: 80, Protocol: string(api.ProtocolTCP)},
+				{HostIP: "127.0.0.1", HostPort: 80, ContainerPort: 80, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
 			},
+			issues: []kobject.PortIssue{loopbackIssue("web", "127.0.0.1")},
 		},
 		{
 			ports: portWithoutIPAddress,
 			want: []kobject.Ports{
-				{HostPort: 80, ContainerPort: 80, Protocol: string(api.ProtocolTCP)},
+				{HostPort: 80, ContainerPort: 80, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
 			},
 		},
 		{
 			ports: portWithoutProtocol,
 			want: []kobject.Ports{
-				{HostPort: 80, ContainerPort: 80, Protocol: string(api.ProtocolTCP)},
+				{HostPort: 80, ContainerPort: 80, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
 			},
 		},
 		{
 			ports: singlePort,
 			want: []kobject.Ports{
-				{ContainerPort: 80, Protocol: string(api.ProtocolTCP)},
+				{ContainerPort: 80, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
 			},
 		},
 		{
 			ports: singlePortsRange,
 			want: []kobject.Ports{
-				{ContainerPort: 3000, Protocol: string(api.ProtocolTCP)},
-				{ContainerPort: 3001, Protocol: string(api.ProtocolTCP)},
-				{ContainerPort: 3002, Protocol: string(api.ProtocolTCP)},
+				{ContainerPort: 3000, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
+				{ContainerPort: 3001, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
+				{ContainerPort: 3002, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
 			},
 		},
 		{
 			ports: targetAndContainerPortsRange,
 			want: []kobject.Ports{
-				{HostPort: 3000, ContainerPort: 5000, Protocol: string(api.ProtocolTCP)},
-				{HostPort: 3001, ContainerPort: 5001, Protocol: string(api.ProtocolTCP)},
-				{HostPort: 3002, ContainerPort: 5002, Protocol: string(api.ProtocolTCP)},
+				{HostPort: 3000, ContainerPort: 5000, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
+				{HostPort: 3001, ContainerPort: 5001, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
+				{HostPort: 3002, ContainerPort: 5002, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
 			},
 		},
 		{
 			ports: targetAndContainerPortsRangeWithIPAddress,
 			want: []kobject.Ports{
-				{HostIP: "127.0.0.1", HostPort: 3000, ContainerPort: 5000, Protocol: string(api.ProtocolTCP)},
-				{HostIP: "127.0.0.1", HostPort: 3001, ContainerPort: 5001, Protocol: string(api.ProtocolTCP)},
-				{HostIP: "127.0.0.1", HostPort: 3002, ContainerPort: 5002, Protocol: string(api.ProtocolTCP)},
+				{HostIP: "127.0.0.1", HostPort: 3000, ContainerPort: 5000, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
+				{HostIP: "127.0.0.1", HostPort: 3001, ContainerPort: 5001, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
+				{HostIP: "127.0.0.1", HostPort: 3002, ContainerPort: 5002, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
 			},
+			// One warning for the address, not one per expanded port.
+			issues: []kobject.PortIssue{loopbackIssue("web", "127.0.0.1")},
 		},
 		{
 			ports: append(append([]types.ServicePortConfig{}, singlePort...), port3000...),
 			want: []kobject.Ports{
-				{HostPort: 0, ContainerPort: 80, Protocol: string(api.ProtocolTCP)},
-				{HostPort: 0, ContainerPort: 3000, Protocol: string(api.ProtocolTCP)},
+				{HostPort: 0, ContainerPort: 80, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
+				{HostPort: 0, ContainerPort: 3000, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
 			},
 		},
 		{
 			ports:  append(append([]types.ServicePortConfig{}, singlePort...), port3000...),
 			expose: []string{"80", "8080"},
+			// expose "80" duplicates the published container port 80 and is
+			// skipped; this used to slip through because the dedupe key mixed
+			// the lower-case compose protocol with the upper-case stored one.
 			want: []kobject.Ports{
-				{ContainerPort: 80, Protocol: string(api.ProtocolTCP)},
-				{ContainerPort: 3000, Protocol: string(api.ProtocolTCP)},
-				{ContainerPort: 80, Protocol: string(api.ProtocolTCP)},
-				{ContainerPort: 8080, Protocol: string(api.ProtocolTCP)},
+				{ContainerPort: 80, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
+				{ContainerPort: 3000, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
+				{ContainerPort: 8080, Protocol: string(api.ProtocolTCP), Mode: kobject.PortModeIngress},
 			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("port=%q,expose=%q", tt.ports, tt.expose), func(t *testing.T) {
-			got := loadPorts(tt.ports, tt.expose)
+			got, issues := loadPorts("web", tt.ports, tt.expose)
 			if diff := cmp.Diff(tt.want, got); diff != "" {
 				t.Errorf("loadPorts() mismatch (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tt.issues, issues); diff != "" {
+				t.Errorf("loadPorts() issue mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -797,6 +811,144 @@ func Test_parseKomposeLabels(t *testing.T) {
 
 			if tt.expected.Name != tt.args.serviceConfig.Name {
 				t.Errorf("Name are not equal, expected: %v, output: %v", tt.expected.Name, tt.args.serviceConfig.Name)
+			}
+		})
+	}
+}
+
+// loopbackIssue builds the port-exposure warning loadPorts emits for a
+// loopback host binding.
+func loopbackIssue(service, hostIP string) kobject.PortIssue {
+	return kobject.PortIssue{
+		Severity: kobject.PortIssueWarning,
+		Category: kobject.PortCategoryExposure,
+		Service:  service,
+		Message:  "host IP " + hostIP + " is a loopback address; binding is only meant for the local host, but a Service exposes the port cluster-wide and NodePort/LoadBalancer expose it further",
+	}
+}
+
+// TestLoadPortsPortIssues covers the port problems loadPorts must surface
+// instead of silently swallowing.
+func TestLoadPortsPortIssues(t *testing.T) {
+	hostRangeToOneTarget, _ := types.ParsePortConfig("8000-8010:80")
+	containerRange, _ := types.ParsePortConfig("3000-3002")
+	hostAndContainerRange, _ := types.ParsePortConfig("8000-8010:9000-9010")
+	hostModePort := []types.ServicePortConfig{{Target: 80, Published: "8080", Protocol: "tcp", Mode: "host"}}
+	ingressModePort := []types.ServicePortConfig{{Target: 80, Published: "8080", Protocol: "tcp", Mode: "ingress"}}
+
+	tests := []struct {
+		desc   string
+		ports  []types.ServicePortConfig
+		expose []string
+		want   []kobject.Ports
+		issues []kobject.PortIssue
+	}{
+		{
+			desc:   "host range aimed at one container port is an error, not port 0",
+			ports:  hostRangeToOneTarget,
+			want:   []kobject.Ports{},
+			issues: []kobject.PortIssue{{Severity: kobject.PortIssueError, Category: kobject.PortCategoryRange, Service: "web", Message: `published port range "8000-8010" on container port 80 is not supported; declare one host-to-container port mapping per line or use matching ranges such as 8000-8010:9000-9010`}},
+		},
+		{
+			desc:  "matching host and container ranges expand pairwise",
+			ports: hostAndContainerRange,
+			want: []kobject.Ports{
+				{HostPort: 8000, ContainerPort: 9000, Protocol: "TCP", Mode: kobject.PortModeIngress},
+				{HostPort: 8001, ContainerPort: 9001, Protocol: "TCP", Mode: kobject.PortModeIngress},
+				{HostPort: 8002, ContainerPort: 9002, Protocol: "TCP", Mode: kobject.PortModeIngress},
+				{HostPort: 8003, ContainerPort: 9003, Protocol: "TCP", Mode: kobject.PortModeIngress},
+				{HostPort: 8004, ContainerPort: 9004, Protocol: "TCP", Mode: kobject.PortModeIngress},
+				{HostPort: 8005, ContainerPort: 9005, Protocol: "TCP", Mode: kobject.PortModeIngress},
+				{HostPort: 8006, ContainerPort: 9006, Protocol: "TCP", Mode: kobject.PortModeIngress},
+				{HostPort: 8007, ContainerPort: 9007, Protocol: "TCP", Mode: kobject.PortModeIngress},
+				{HostPort: 8008, ContainerPort: 9008, Protocol: "TCP", Mode: kobject.PortModeIngress},
+				{HostPort: 8009, ContainerPort: 9009, Protocol: "TCP", Mode: kobject.PortModeIngress},
+				{HostPort: 8010, ContainerPort: 9010, Protocol: "TCP", Mode: kobject.PortModeIngress},
+			},
+		},
+		{
+			desc:  "container range without host ports is preserved",
+			ports: containerRange,
+			want: []kobject.Ports{
+				{ContainerPort: 3000, Protocol: "TCP", Mode: kobject.PortModeIngress},
+				{ContainerPort: 3001, Protocol: "TCP", Mode: kobject.PortModeIngress},
+				{ContainerPort: 3002, Protocol: "TCP", Mode: kobject.PortModeIngress},
+			},
+		},
+		{
+			desc:  "mode host is preserved on the port",
+			ports: hostModePort,
+			want:  []kobject.Ports{{HostPort: 8080, ContainerPort: 80, Protocol: "TCP", Mode: kobject.PortModeHost}},
+		},
+		{
+			desc:  "mode ingress is preserved on the port",
+			ports: ingressModePort,
+			want:  []kobject.Ports{{HostPort: 8080, ContainerPort: 80, Protocol: "TCP", Mode: kobject.PortModeIngress}},
+		},
+		{
+			desc:   "unknown mode is an error",
+			ports:  []types.ServicePortConfig{{Target: 80, Published: "8080", Protocol: "tcp", Mode: "bridge"}},
+			want:   []kobject.Ports{},
+			issues: []kobject.PortIssue{{Severity: kobject.PortIssueError, Category: kobject.PortCategoryMode, Service: "web", Message: `unsupported mode "bridge" on port 80/tcp, supported values are "host" and "ingress"`}},
+		},
+		{
+			desc:   "expose range expands",
+			expose: []string{"3000-3002"},
+			want: []kobject.Ports{
+				{ContainerPort: 3000, Protocol: "TCP", Mode: kobject.PortModeIngress},
+				{ContainerPort: 3001, Protocol: "TCP", Mode: kobject.PortModeIngress},
+				{ContainerPort: 3002, Protocol: "TCP", Mode: kobject.PortModeIngress},
+			},
+		},
+		{
+			desc:   "invalid expose range is an error",
+			expose: []string{"3000-abc"},
+			want:   []kobject.Ports{},
+			issues: []kobject.PortIssue{{Severity: kobject.PortIssueError, Category: kobject.PortCategoryRange, Service: "web", Message: `invalid expose entry "3000-abc": invalid port "3000-abc"`}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			got, issues := loadPorts("web", tt.ports, tt.expose)
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("loadPorts() mismatch (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tt.issues, issues); diff != "" {
+				t.Errorf("loadPorts() issues mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestParseNodePortsLabel(t *testing.T) {
+	tests := []struct {
+		value   string
+		want    map[int32]int32
+		wantErr string
+	}{
+		{value: "", want: map[int32]int32{}},
+		{value: "80:30080", want: map[int32]int32{80: 30080}},
+		{value: " 80:30080 , 443:30443 ", want: map[int32]int32{80: 30080, 443: 30443}},
+		{value: "80:30080,80:30081", wantErr: "container port 80 is assigned a node port more than once"},
+		{value: "80", wantErr: `entry "80" must be in the form <container-port>:<node-port>`},
+		{value: "0:30080", wantErr: `entry "0:30080" has an invalid container port`},
+		{value: "80:70000", wantErr: `entry "80:70000" has an invalid node port`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			got, err := parseNodePortsLabel(tt.value)
+			if tt.wantErr != "" {
+				if err == nil || err.Error() != tt.wantErr {
+					t.Fatalf("expected error %q, got %v", tt.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("parseNodePortsLabel() mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}

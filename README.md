@@ -128,6 +128,7 @@ Here is a list of all available docs:
 - [Quick start](docs/getting-started.md)
 - [Installation](docs/installation.md)
 - [User guide](docs/user-guide.md)
+- [Service port derivation](docs/service-port-derivation.md)
 - [Conversion](docs/conversion.md)
 - [Architecture](docs/architecture.md)
 - [Development](docs/development.md)
